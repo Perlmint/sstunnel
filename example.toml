@@ -1,0 +1,97 @@
+# ssh-tunnel configuration.
+#
+# Copy to ~/.config/ssh-tunnel/config.toml (or %APPDATA%\ssh-tunnel\config.toml
+# on Windows), then run `ssh-tunnel check` to validate it.
+#
+# The daemon watches this file: saving it applies the changes without dropping
+# tunnels that did not change. A file that fails to parse is ignored, and the
+# last good configuration stays in force.
+
+[daemon]
+# IPC endpoint. Defaults to a per-user socket (unix) or named pipe (Windows).
+# socket = "~/.local/state/ssh-tunnel/ipc.sock"
+# OpenSSH client config to fill in missing host settings [default: ~/.ssh/config].
+# Re-read on `ssh-tunnel reload`, not watched (see the README).
+# ssh_config = "~/.ssh/config"
+log_level = "info"
+watch_config = true
+# Remember `ssh-tunnel enable/disable` decisions across daemon restarts.
+persist_state = true
+
+# ---------------------------------------------------------------------------
+# Hosts: one persistent SSH session each, opened when a forward needs it.
+#
+# `hostname` is the only required field. It is the alias you would type after
+# `ssh`, and it is what gets looked up in ~/.ssh/config -- so everything else
+# below can be left out when that file already says it:
+#
+#   [hosts.prod]
+#   hostname = "prod"          # resolves HostName, Port, User and IdentityFile
+#
+# A host that cannot resolve a username from either place is reported as
+# invalid: `ssh-tunnel status` shows the reason, its forwards do not start, and
+# `ssh-tunnel check` exits non-zero. Every other host keeps running.
+# ---------------------------------------------------------------------------
+
+[hosts.prod]
+# The ~/.ssh/config alias, or a literal address when there is nothing to match.
+hostname = "bastion.example.com"
+# Unset means "whatever ~/.ssh/config says", then 22.
+port = 22
+# Unset means "whatever ~/.ssh/config says". No user from either -> invalid.
+user = "gyusun"
+# Set false to ignore ~/.ssh/config for this host.
+use_ssh_config = true
+
+# Authentication is tried in order: the ssh-agent first, then each identity.
+# Unset identities come from IdentityFile in ~/.ssh/config.
+use_agent = true
+identity = ["~/.ssh/id_ed25519"]
+# A background service cannot prompt for a passphrase. For an encrypted key,
+# either use the agent or name an environment variable holding the passphrase:
+# identity_passphrase_env = "PROD_KEY_PASSPHRASE"
+
+known_hosts = "~/.ssh/known_hosts"
+# yes         reject a host that is not already in known_hosts
+# accept-new  learn unknown hosts, still reject changed keys (default)
+# no          accept anything (insecure)
+strict_host_key_checking = "accept-new"
+
+connect_timeout = "10s"
+keepalive_interval = "30s"
+keepalive_max = 3
+reconnect = { initial = "1s", max = "60s", factor = 2.0 }
+# Stay connected even when every forward on this host is off.
+persistent = false
+
+# ---------------------------------------------------------------------------
+# Forwards. `name` is the handle used by enable/disable/toggle/restart.
+# `listen` accepts "addr:port", "[::1]:port", or a bare port (implies 127.0.0.1).
+# ---------------------------------------------------------------------------
+
+# -L: listen here, connect from the server.
+[[forwards]]
+name = "db"
+host = "prod"
+type = "local"
+listen = "127.0.0.1:5432"
+target = "db.internal:5432"
+enabled = true
+
+# -D: a local SOCKS5 proxy tunnelled over the session.
+[[forwards]]
+name = "socks"
+host = "prod"
+type = "dynamic"
+listen = "1080"
+enabled = false
+
+# -R: the server listens, connections come back to a local target.
+# A non-loopback `listen` requires GatewayPorts on the server. Port 0 lets the
+# server choose; `ssh-tunnel status` reports which one it picked.
+[[forwards]]
+name = "webhook"
+host = "prod"
+type = "remote"
+listen = "127.0.0.1:9000"
+target = "127.0.0.1:3000"
