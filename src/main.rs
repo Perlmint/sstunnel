@@ -35,6 +35,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon(args) => run_daemon(config_path, cli.socket, args),
+        #[cfg(target_os = "macos")]
+        Command::Tray => {
+            let endpoint = client_endpoint(cli.socket, &config_path)?;
+            ssh_tunnel::tray::run(config_path, endpoint)?;
+            Ok(ExitCode::SUCCESS)
+        }
         command => {
             let endpoint = client_endpoint(cli.socket, &config_path)?;
             runtime()?.block_on(run_client(command, endpoint))
@@ -77,6 +83,8 @@ async fn run_client(command: Command, endpoint: String) -> Result<ExitCode> {
         Command::Shutdown => Request::Shutdown,
         // Handled before we get here.
         Command::Daemon(_) | Command::Check | Command::Service { .. } => unreachable!(),
+        #[cfg(target_os = "macos")]
+        Command::Tray => unreachable!(),
     };
 
     match ipc::client::request(&endpoint, &request).await? {

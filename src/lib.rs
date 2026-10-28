@@ -10,4 +10,6 @@ pub mod service;
 pub mod ssh;
 pub mod ssh_config;
 pub mod state;
+#[cfg(target_os = "macos")]
+pub mod tray;
 pub mod watcher;

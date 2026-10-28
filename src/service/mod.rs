@@ -29,7 +29,10 @@ pub const LABEL: &str = "ssh-tunnel";
 
 pub fn run(action: &ServiceAction, config_path: &Path) -> Result<()> {
     match action {
-        ServiceAction::Install => platform::install(config_path),
+        #[cfg(target_os = "macos")]
+        ServiceAction::Install(args) => platform::install(config_path, !args.no_tray),
+        #[cfg(not(target_os = "macos"))]
+        ServiceAction::Install(_) => platform::install(config_path),
         ServiceAction::Uninstall => platform::uninstall(),
         ServiceAction::Start => platform::start(),
         ServiceAction::Stop => platform::stop(),

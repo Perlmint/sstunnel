@@ -60,6 +60,7 @@ ssh-tunnel service uninstall
 | `shutdown` | Stop the daemon. |
 | `check` | Validate the config and exit non-zero if it is wrong. |
 | `service install\|uninstall\|start\|stop\|status` | Register with the OS service manager. |
+| `tray` | macOS: a menu bar item with one submenu per host; check a forward to enable it. |
 
 Runtime overrides beat the file: a forward you `disable` stays off across config
 reloads and (with `persist_state`) across daemon restarts, until you enable it
@@ -185,7 +186,11 @@ ssh-agent, `known_hosts`, and profile, which is exactly what SSH authentication
 needs.
 
 - **macOS** — a LaunchAgent at `~/Library/LaunchAgents/dev.perlmint.ssh-tunnel.plist`,
-  logging to `~/Library/Logs/ssh-tunnel/`.
+  logging to `~/Library/Logs/ssh-tunnel/`. A second agent,
+  `dev.perlmint.ssh-tunnel.tray`, keeps the menu bar item (`ssh-tunnel tray`)
+  running at login; skip it with `service install --no-tray`. Quitting the menu
+  bar item keeps it closed until the next login or `service start`;
+  `service stop` stops only the daemon.
 - **Linux** — a systemd user unit at `~/.config/systemd/user/ssh-tunnel.service`
   (`journalctl --user -u ssh-tunnel -f`). On a headless box, run
   `loginctl enable-linger <user>` so it starts without a login session.

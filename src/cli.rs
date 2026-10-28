@@ -47,6 +47,9 @@ pub enum Command {
     Shutdown,
     /// Validate the config file and exit
     Check,
+    /// Show a menu bar item to watch and switch tunnels
+    #[cfg(target_os = "macos")]
+    Tray,
     /// Register the daemon with the OS service manager
     Service {
         #[command(subcommand)]
@@ -86,10 +89,18 @@ pub struct NameArgs {
     pub all: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct InstallArgs {
+    /// Do not also start the menu bar item at login
+    #[cfg(target_os = "macos")]
+    #[arg(long)]
+    pub no_tray: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ServiceAction {
     /// Install and start the per-user service
-    Install,
+    Install(InstallArgs),
     /// Stop and remove the service
     Uninstall,
     /// Start the installed service
