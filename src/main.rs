@@ -1,5 +1,5 @@
-// No console window for the daemon and tray when started at logon;
-// command-line use attaches to the caller's console instead.
+// No console window for the daemon and tray when started at logon; other
+// commands borrow the caller's console, or open their own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
@@ -17,8 +17,21 @@ use ssh_config::SshConfigFile;
 
 fn main() -> ExitCode {
     #[cfg(windows)]
-    attach_parent_console();
-    let cli = Cli::parse();
+    let mut console = console::Console::attach();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Usage errors, --help and --version all need somewhere to print.
+            #[cfg(windows)]
+            console.ensure();
+            let _ = err.print();
+            return ExitCode::from(err.exit_code() as u8);
+        }
+    };
+    #[cfg(windows)]
+    if !matches!(cli.command, Command::Daemon(_) | Command::Tray) {
+        console.ensure();
+    }
     match dispatch(cli) {
         Ok(code) => code,
         Err(err) => {
@@ -200,51 +213,84 @@ fn client_endpoint(socket: Option<String>, config_path: &Path) -> Result<String>
     resolve_endpoint(None, config.as_ref())
 }
 
-/// A GUI-subsystem process starts without a console. When launched from one,
-/// borrow it so output reaches the terminal; output the caller redirected to a
-/// file or pipe arrives as valid handles and is left alone.
+/// A GUI-subsystem process starts without a console, so one is borrowed or
+/// made only when output has nowhere else to go.
 #[cfg(windows)]
-fn attach_parent_console() {
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
+mod console {
+    use std::fs::{File, OpenOptions};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::windows::io::IntoRawHandle;
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
-        STD_OUTPUT_HANDLE, SetStdHandle,
+        ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole, GetStdHandle, STD_ERROR_HANDLE,
+        STD_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
     };
 
-    let usable = |std: STD_HANDLE| {
+    pub struct Console {
+        /// Output already reaches a console, file, or pipe.
+        connected: bool,
+        /// We opened this window, so it closes with us.
+        allocated: bool,
+    }
+
+    impl Console {
+        /// Borrow the parent's console when launched from a terminal. Output the
+        /// caller redirected to a file or pipe is left alone.
+        pub fn attach() -> Self {
+            let connected = (usable(STD_OUTPUT_HANDLE) && usable(STD_ERROR_HANDLE))
+                || (unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 && reopen_output());
+            Console {
+                connected,
+                allocated: false,
+            }
+        }
+
+        /// Open a console window when there is no parent console to write to,
+        /// e.g. when started from Explorer or the Run dialog.
+        pub fn ensure(&mut self) {
+            if self.connected {
+                return;
+            }
+            if unsafe { AllocConsole() } != 0 && reopen_output() {
+                self.connected = true;
+                self.allocated = true;
+            }
+        }
+    }
+
+    impl Drop for Console {
+        /// A console we opened vanishes on exit; keep it until the output is read.
+        fn drop(&mut self) {
+            if !self.allocated {
+                return;
+            }
+            eprint!("\nPress Enter to close this window.");
+            let _ = std::io::stderr().flush();
+            if let Ok(input) = File::open("CONIN$") {
+                let _ = BufReader::new(input).read_line(&mut String::new());
+            }
+        }
+    }
+
+    fn usable(std: STD_HANDLE) -> bool {
         let handle = unsafe { GetStdHandle(std) };
         !handle.is_null() && handle != INVALID_HANDLE_VALUE
-    };
-    if usable(STD_OUTPUT_HANDLE) && usable(STD_ERROR_HANDLE) {
-        return;
-    }
-    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
-        // Started by the task scheduler or Explorer: nowhere to write.
-        return;
     }
 
-    let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
-    let console = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-    if console == INVALID_HANDLE_VALUE {
-        return;
-    }
-    for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        if !usable(std) {
-            unsafe { SetStdHandle(std, console) };
+    /// Point whichever of stdout/stderr has no handle at the console.
+    fn reopen_output() -> bool {
+        let Ok(console) = OpenOptions::new().read(true).write(true).open("CONOUT$") else {
+            return false;
+        };
+        // Intentionally leaked: it backs stdout/stderr for the life of the process.
+        let handle = console.into_raw_handle();
+        for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            if !usable(std) {
+                unsafe { SetStdHandle(std, handle) };
+            }
         }
+        true
     }
 }
 
