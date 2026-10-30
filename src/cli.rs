@@ -47,8 +47,8 @@ pub enum Command {
     Shutdown,
     /// Validate the config file and exit
     Check,
-    /// Show a menu bar item to watch and switch tunnels
-    #[cfg(target_os = "macos")]
+    /// Show a menu bar (macOS) or tray (Windows) icon to watch and switch tunnels
+    #[cfg(any(target_os = "macos", windows))]
     Tray,
     /// Register the daemon with the OS service manager
     Service {
@@ -91,8 +91,8 @@ pub struct NameArgs {
 
 #[derive(Debug, Args)]
 pub struct InstallArgs {
-    /// Do not also start the menu bar item at login
-    #[cfg(target_os = "macos")]
+    /// Do not also start the menu bar / tray icon at login
+    #[cfg(any(target_os = "macos", windows))]
     #[arg(long)]
     pub no_tray: bool,
 }

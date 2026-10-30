@@ -60,7 +60,7 @@ ssh-tunnel service uninstall
 | `shutdown` | Stop the daemon. |
 | `check` | Validate the config and exit non-zero if it is wrong. |
 | `service install\|uninstall\|start\|stop\|status` | Register with the OS service manager. |
-| `tray` | macOS: a menu bar item with one submenu per host; check a forward to enable it. |
+| `tray` | macOS menu bar / Windows tray icon with one submenu per host; check a forward to enable it. |
 
 Runtime overrides beat the file: a forward you `disable` stays off across config
 reloads and (with `persist_state`) across daemon restarts, until you enable it
@@ -195,7 +195,16 @@ needs.
   (`journalctl --user -u ssh-tunnel -f`). On a headless box, run
   `loginctl enable-linger <user>` so it starts without a login session.
 - **Windows** — a scheduled task that runs at logon, logging to a file (a
-  scheduled task has nowhere to send stderr).
+  scheduled task has nowhere to send stderr). A second task, `ssh-tunnel-tray`,
+  starts the tray icon; skip it with `service install --no-tray`. `service stop`
+  stops only the daemon.
+
+  The Windows build uses the GUI subsystem so neither task opens a console
+  window. From a terminal it attaches to the caller's console, but `cmd` and
+  PowerShell do not wait for GUI programs: output can appear after the next
+  prompt and the exit code is not reported. Redirected or piped output
+  (`ssh-tunnel status --json > status.json`, `... | Out-Host`) waits and keeps
+  the exit code.
 
 ## Development
 

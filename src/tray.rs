@@ -1,8 +1,10 @@
-//! macOS menu bar item: one submenu per SSH host, one checkbox per forward.
+//! macOS menu bar item / Windows tray icon: one submenu per SSH host, one
+//! checkbox per forward.
 //!
 //! The tray is just another IPC client. A worker thread polls the daemon and
-//! runs requests; the main thread owns AppKit and only ever renders reports.
+//! runs requests; the main thread owns the UI and only ever renders reports.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
@@ -11,12 +13,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
-use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tokio::sync::mpsc;
 use tray_icon::menu::{
-    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, NativeIcon, PredefinedMenuItem, Submenu,
+    CheckMenuItem, IsMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
 };
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::cli::ServiceAction;
 use crate::ipc::protocol::{
@@ -80,9 +81,14 @@ impl Action {
 }
 
 pub fn run(config_path: PathBuf, endpoint: String) -> Result<()> {
+    #[allow(unused_mut)]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    // Menu bar only: no Dock icon, no app menu.
-    event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        // Menu bar only: no Dock icon, no app menu.
+        event_loop.set_activation_policy(ActivationPolicy::Accessory);
+    }
 
     let proxy = event_loop.create_proxy();
     let menu_proxy = proxy.clone();
@@ -91,7 +97,14 @@ pub fn run(config_path: PathBuf, endpoint: String) -> Result<()> {
     }));
     let click_proxy = proxy.clone();
     TrayIconEvent::set_event_handler(Some(move |event| {
-        if matches!(event, TrayIconEvent::Click { .. }) {
+        // Windows reports both press and release; refresh once.
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        ) {
             let _ = click_proxy.send_event(UserEvent::TrayClicked);
         }
     }));
@@ -124,7 +137,7 @@ pub fn run(config_path: PathBuf, endpoint: String) -> Result<()> {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
-            // AppKit is only ready to host a status item once the loop runs.
+            // The platform is only ready to host a tray item once the loop runs.
             Event::NewEvents(StartCause::Init) => match Tray::new() {
                 Ok(created) => tray = Some(created),
                 Err(err) => {
@@ -188,7 +201,7 @@ async fn worker(
                         .await;
                         match started {
                             Ok(Ok(())) => {
-                                // Give launchd a moment before the status poll.
+                                // Give the service manager a moment before the status poll.
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 None
                             }
@@ -231,10 +244,15 @@ struct HostItems {
     submenu: Submenu,
     address: MenuItem,
     state: MenuItem,
+    /// What the submenu's status dot currently shows, to skip redundant redraws.
+    health: Cell<Option<Health>>,
 }
 
 struct Tray {
     icon: TrayIcon,
+    icons: platform::Icons,
+    /// Whether the tray currently flags a problem; `None` before the first status.
+    alert: Cell<Option<bool>>,
     layout: Option<Layout>,
     header: MenuItem,
     error_item: Option<MenuItem>,
@@ -250,13 +268,18 @@ struct Tray {
 impl Tray {
     fn new() -> Result<Self> {
         let header = MenuItem::new("Connecting to daemon…", false, None);
-        let icon = TrayIconBuilder::new()
-            .with_icon_templated(icon()?)
+        let icons = platform::Icons::new()?;
+        let builder = TrayIconBuilder::new()
             .with_tooltip("ssh-tunnel")
+            .with_menu_on_left_click(true);
+        let icon = icons
+            .apply(builder)
             .build()
-            .context("creating the menu bar item")?;
+            .context("creating the tray icon")?;
         Ok(Tray {
             icon,
+            icons,
+            alert: Cell::new(None),
             layout: None,
             header,
             error_item: None,
@@ -369,7 +392,7 @@ impl Tray {
             for host in &report.hosts {
                 let address = MenuItem::new("", false, None);
                 let state = MenuItem::new("", false, None);
-                let submenu = Submenu::new(&host.name, true);
+                let submenu = Submenu::new(platform::menu_text(&host.name), true);
                 let _ = submenu.append_items(&[&address, &state, &separator]);
 
                 let forwards: Vec<&ForwardReport> = report
@@ -423,6 +446,7 @@ impl Tray {
                         submenu,
                         address,
                         state,
+                        health: Cell::new(None),
                     },
                 );
             }
@@ -447,7 +471,7 @@ impl Tray {
         top.push(Box::new(separator.clone()));
         top.push(Box::new(MenuItem::with_id(
             Action::Quit.id(),
-            "Quit Menu Bar Item",
+            platform::QUIT_LABEL,
             true,
             None,
         )));
@@ -460,14 +484,16 @@ impl Tray {
     fn update(&self) {
         if let Some(item) = &self.error_item {
             let message = self.error.as_deref().unwrap_or_default();
-            item.set_text(format!("⚠ {}", first_line(message)));
+            item.set_text(platform::menu_text(&format!("⚠ {}", first_line(message))));
         }
 
         let Some(report) = &self.report else {
             let message = self.status_error.as_deref().unwrap_or("Daemon not running");
-            self.header.set_text(message);
-            let _ = self.icon.set_tooltip(Some(format!("ssh-tunnel: {message}")));
-            self.icon.set_title(Some("!"));
+            self.header.set_text(platform::menu_text(message));
+            let _ = self
+                .icon
+                .set_tooltip(Some(format!("ssh-tunnel: {message}")));
+            self.set_alert(true);
             return;
         };
 
@@ -484,16 +510,25 @@ impl Tray {
                 .any(|h| matches!(h.state, HostState::Invalid { .. }));
         let summary = format!("{up} of {wanted} tunnels up");
         self.header.set_text(&summary);
-        let _ = self.icon.set_tooltip(Some(format!("ssh-tunnel: {summary}")));
-        self.icon.set_title(failing.then_some("!"));
+        let _ = self
+            .icon
+            .set_tooltip(Some(format!("ssh-tunnel: {summary}")));
+        self.set_alert(failing);
 
         for host in &report.hosts {
             let Some(items) = self.hosts.get(&host.name) else {
                 continue;
             };
-            items.submenu.set_native_icon(Some(host_icon(host)));
-            items.address.set_text(host_address(host));
-            items.state.set_text(host_state(&host.state));
+            let health = Health::of(&host.state);
+            if items.health.replace(Some(health)) != Some(health) {
+                self.icons.set_health(&items.submenu, health);
+            }
+            items
+                .address
+                .set_text(platform::menu_text(&host_address(host)));
+            items
+                .state
+                .set_text(platform::menu_text(&host_state(&host.state)));
         }
 
         for forward in &report.forwards {
@@ -501,24 +536,145 @@ impl Tray {
                 continue;
             };
             item.set_checked(forward.desired);
-            item.set_text(forward_label(forward));
+            item.set_text(platform::menu_text(&forward_label(forward)));
         }
+    }
+
+    fn set_alert(&self, alert: bool) {
+        if self.alert.replace(Some(alert)) != Some(alert) {
+            self.icons.set_alert(&self.icon, alert);
+        }
+    }
+}
+
+/// A host's state, reduced to the colour of its status dot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Health {
+    Up,
+    Pending,
+    Down,
+    Idle,
+}
+
+impl Health {
+    fn of(state: &HostState) -> Self {
+        match state {
+            HostState::Connected => Health::Up,
+            HostState::Connecting | HostState::Reconnecting { .. } => Health::Pending,
+            HostState::Invalid { .. } => Health::Down,
+            HostState::Idle => Health::Idle,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use anyhow::Result;
+    use tray_icon::menu::{NativeIcon, Submenu};
+    use tray_icon::{TrayIcon, TrayIconBuilder};
+
+    use super::{Health, draw_tray_icon};
+
+    pub const QUIT_LABEL: &str = "Quit Menu Bar Item";
+
+    pub struct Icons;
+
+    impl Icons {
+        pub fn new() -> Result<Self> {
+            Ok(Icons)
+        }
+
+        /// A black template image, which AppKit tints for light and dark menu bars.
+        pub fn apply(&self, builder: TrayIconBuilder) -> TrayIconBuilder {
+            match draw_tray_icon(36, [0, 0, 0], false) {
+                Ok(icon) => builder.with_icon_templated(icon),
+                Err(_) => builder.with_title("ssh-tunnel"),
+            }
+        }
+
+        /// Template images cannot carry colour, so problems get a title badge.
+        pub fn set_alert(&self, icon: &TrayIcon, alert: bool) {
+            icon.set_title(alert.then_some("!"));
+        }
+
+        pub fn set_health(&self, submenu: &Submenu, health: Health) {
+            submenu.set_native_icon(Some(match health {
+                Health::Up => NativeIcon::StatusAvailable,
+                Health::Pending => NativeIcon::StatusPartiallyAvailable,
+                Health::Down => NativeIcon::StatusUnavailable,
+                Health::Idle => NativeIcon::StatusNone,
+            }));
+        }
+    }
+
+    pub fn menu_text(text: &str) -> String {
+        text.to_owned()
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use anyhow::Result;
+    use tray_icon::menu::{Icon as MenuIcon, Submenu};
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+    use super::{Health, draw_dot, draw_tray_icon};
+
+    pub const QUIT_LABEL: &str = "Quit Tray Icon";
+
+    /// Readable on both the light and the dark taskbar.
+    const ACCENT: [u8; 3] = [0x2b, 0x7d, 0xe9];
+
+    pub struct Icons {
+        normal: Icon,
+        alert: Icon,
+        up: MenuIcon,
+        pending: MenuIcon,
+        down: MenuIcon,
+        idle: MenuIcon,
+    }
+
+    impl Icons {
+        pub fn new() -> Result<Self> {
+            Ok(Icons {
+                normal: draw_tray_icon(32, ACCENT, false)?,
+                alert: draw_tray_icon(32, ACCENT, true)?,
+                up: draw_dot([0x2e, 0xa0, 0x43])?,
+                pending: draw_dot([0xe0, 0x9b, 0x1a])?,
+                down: draw_dot([0xe5, 0x3e, 0x3e])?,
+                idle: draw_dot([0x8a, 0x8a, 0x8a])?,
+            })
+        }
+
+        pub fn apply(&self, builder: TrayIconBuilder) -> TrayIconBuilder {
+            builder.with_icon(self.normal.clone())
+        }
+
+        /// The taskbar has no room for a title, so problems get a red badge.
+        pub fn set_alert(&self, icon: &TrayIcon, alert: bool) {
+            let image = if alert { &self.alert } else { &self.normal };
+            let _ = icon.set_icon(Some(image.clone()));
+        }
+
+        pub fn set_health(&self, submenu: &Submenu, health: Health) {
+            let dot = match health {
+                Health::Up => &self.up,
+                Health::Pending => &self.pending,
+                Health::Down => &self.down,
+                Health::Idle => &self.idle,
+            };
+            submenu.set_icon(Some(dot.clone()));
+        }
+    }
+
+    /// Win32 menus read `&` as a mnemonic marker; `&&` is a literal ampersand.
+    pub fn menu_text(text: &str) -> String {
+        text.replace('&', "&&")
     }
 }
 
 fn is_up(forward: &ForwardReport) -> bool {
     matches!(forward.state, ForwardState::Listening { .. })
-}
-
-fn host_icon(host: &HostReport) -> NativeIcon {
-    match host.state {
-        HostState::Connected => NativeIcon::StatusAvailable,
-        HostState::Connecting | HostState::Reconnecting { .. } => {
-            NativeIcon::StatusPartiallyAvailable
-        }
-        HostState::Invalid { .. } => NativeIcon::StatusUnavailable,
-        HostState::Idle => NativeIcon::StatusNone,
-    }
 }
 
 fn host_address(host: &HostReport) -> String {
@@ -574,35 +730,72 @@ fn first_line(text: &str) -> String {
     }
 }
 
-/// A tunnel mouth over a ground line, drawn as a template image so AppKit
-/// tints it for light and dark menu bars.
-fn icon() -> Result<Icon> {
-    const SIZE: u32 = 36;
-    const SAMPLES: u32 = 4;
-    let (cx, base) = (SIZE as f32 / 2.0, 28.0);
-    let (outer, inner) = (15.0, 8.5);
+/// A tunnel mouth over a ground line, `size` pixels square. With `badge`, a
+/// red dot in the bottom-right corner, cut out from the shape behind it.
+fn draw_tray_icon(size: u32, color: [u8; 3], badge: bool) -> Result<Icon> {
+    const BADGE: [u8; 3] = [0xe5, 0x3e, 0x3e];
+    // Designed on a 36px grid.
+    let unit = size as f32 / 36.0;
+    let (cx, base) = (18.0 * unit, 28.0 * unit);
+    let (outer, inner) = (15.0 * unit, 8.5 * unit);
+    let (badge_x, badge_y, badge_r) = (28.0 * unit, 26.0 * unit, 7.0 * unit);
 
-    let covered = |x: f32, y: f32| {
-        let ground = (base..base + 3.0).contains(&y) && (1.0..SIZE as f32 - 1.0).contains(&x);
+    let rgba = rasterize(size, |x, y| {
+        if badge {
+            let distance = ((x - badge_x).powi(2) + (y - badge_y).powi(2)).sqrt();
+            if distance <= badge_r {
+                return Some(BADGE);
+            }
+            if distance <= badge_r + 2.0 * unit {
+                return None;
+            }
+        }
+        let ground =
+            (base..base + 3.0 * unit).contains(&y) && (unit..size as f32 - unit).contains(&x);
         let distance = ((x - cx).powi(2) + (y - base).powi(2)).sqrt();
         let arch = y < base && (inner..=outer).contains(&distance);
-        ground || arch
-    };
+        (ground || arch).then_some(color)
+    });
+    Icon::from_rgba(rgba, size, size).context("building the tray icon")
+}
 
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for py in 0..SIZE {
-        for px in 0..SIZE {
-            let mut hits = 0;
+/// A status dot for menu items, which take muda's own icon type.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn draw_dot(color: [u8; 3]) -> Result<tray_icon::menu::Icon> {
+    let rgba = rasterize(16, |x, y| {
+        (((x - 8.0).powi(2) + (y - 8.0).powi(2)).sqrt() <= 5.5).then_some(color)
+    });
+    tray_icon::menu::Icon::from_rgba(rgba, 16, 16).context("building a status icon")
+}
+
+/// Antialias a shape by supersampling: `paint` gives each sample point's colour,
+/// or `None` where the image is transparent. Returns RGBA rows.
+fn rasterize(size: u32, paint: impl Fn(f32, f32) -> Option<[u8; 3]>) -> Vec<u8> {
+    const SAMPLES: u32 = 4;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..size {
+        for px in 0..size {
+            let (mut hits, mut sum) = (0u32, [0u32; 3]);
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
                     let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
                     let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
-                    hits += covered(x, y) as u32;
+                    if let Some(color) = paint(x, y) {
+                        hits += 1;
+                        for (total, channel) in sum.iter_mut().zip(color) {
+                            *total += channel as u32;
+                        }
+                    }
                 }
             }
-            let alpha = (hits * 255 / (SAMPLES * SAMPLES)) as u8;
-            rgba.extend_from_slice(&[0, 0, 0, alpha]);
+            let average = |total: u32| total.checked_div(hits).unwrap_or(0) as u8;
+            rgba.extend_from_slice(&[
+                average(sum[0]),
+                average(sum[1]),
+                average(sum[2]),
+                (hits * 255 / (SAMPLES * SAMPLES)) as u8,
+            ]);
         }
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).context("building the menu bar icon")
+    rgba
 }

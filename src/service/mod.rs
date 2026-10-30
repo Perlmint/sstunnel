@@ -29,9 +29,9 @@ pub const LABEL: &str = "ssh-tunnel";
 
 pub fn run(action: &ServiceAction, config_path: &Path) -> Result<()> {
     match action {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         ServiceAction::Install(args) => platform::install(config_path, !args.no_tray),
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         ServiceAction::Install(_) => platform::install(config_path),
         ServiceAction::Uninstall => platform::uninstall(),
         ServiceAction::Start => platform::start(),
@@ -45,9 +45,22 @@ pub fn executable() -> Result<PathBuf> {
     std::env::current_exe().context("could not determine this executable's path")
 }
 
+/// A command that never opens a console window, even from a windowless process.
+fn command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 /// Run a command, returning stdout and failing with stderr.
 pub fn output(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
+    let output = command(program)
         .args(args)
         .output()
         .with_context(|| format!("running `{program}`"))?;
@@ -66,7 +79,7 @@ pub fn output(program: &str, args: &[&str]) -> Result<String> {
 
 /// Run a command, ignoring failure. Used for "stop it if it happens to be running".
 pub fn output_ignoring_failure(program: &str, args: &[&str]) {
-    let _ = Command::new(program).args(args).output();
+    let _ = command(program).args(args).output();
 }
 
 pub fn write_unit(path: &Path, contents: &str) -> Result<()> {

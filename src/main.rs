@@ -1,3 +1,7 @@
+// No console window for the daemon and tray when started at logon;
+// command-line use attaches to the caller's console instead.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -12,6 +16,8 @@ use ipc::protocol::{ForwardReport, HostReport, Request, Response, Selection, Sta
 use ssh_config::SshConfigFile;
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console();
     let cli = Cli::parse();
     match dispatch(cli) {
         Ok(code) => code,
@@ -35,7 +41,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Daemon(args) => run_daemon(config_path, cli.socket, args),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Command::Tray => {
             let endpoint = client_endpoint(cli.socket, &config_path)?;
             ssh_tunnel::tray::run(config_path, endpoint)?;
@@ -83,7 +89,7 @@ async fn run_client(command: Command, endpoint: String) -> Result<ExitCode> {
         Command::Shutdown => Request::Shutdown,
         // Handled before we get here.
         Command::Daemon(_) | Command::Check | Command::Service { .. } => unreachable!(),
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         Command::Tray => unreachable!(),
     };
 
@@ -192,6 +198,54 @@ fn client_endpoint(socket: Option<String>, config_path: &Path) -> Result<String>
     }
     let config = Config::load(config_path).ok();
     resolve_endpoint(None, config.as_ref())
+}
+
+/// A GUI-subsystem process starts without a console. When launched from one,
+/// borrow it so output reaches the terminal; output the caller redirected to a
+/// file or pipe arrives as valid handles and is left alone.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+
+    let usable = |std: STD_HANDLE| {
+        let handle = unsafe { GetStdHandle(std) };
+        !handle.is_null() && handle != INVALID_HANDLE_VALUE
+    };
+    if usable(STD_OUTPUT_HANDLE) && usable(STD_ERROR_HANDLE) {
+        return;
+    }
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        // Started by the task scheduler or Explorer: nowhere to write.
+        return;
+    }
+
+    let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+    let console = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if console == INVALID_HANDLE_VALUE {
+        return;
+    }
+    for std in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        if !usable(std) {
+            unsafe { SetStdHandle(std, console) };
+        }
+    }
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
